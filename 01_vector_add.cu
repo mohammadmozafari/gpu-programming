@@ -2,89 +2,131 @@
 #include <stdlib.h>
 #include <time.h>
 #include <cuda_runtime.h>
+#include <math.h>
 
-// GPU kernel
-__global__ void add(float* a, float* b, float* c, int N) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < N) {
-        c[index] = a[index] + b[index];
-    }
-}
+#define N (1 << 20)       // ~1 million elements
+#define THREADS_PER_BLOCK 256
+#define CPU_RUNS 5
+#define GPU_RUNS 10
 
-// CPU implementation
-void add_cpu(float* a, float* b, float* c, int N) {
-    for (int i = 0; i < N; i++) {
+// ---------------- CPU function ----------------
+void vector_add_cpu(const float* a, const float* b, float* c, int n) {
+    for (int i = 0; i < n; i++) {
         c[i] = a[i] + b[i];
     }
 }
 
-int main() {
-    int N = 1 << 24;                        // ~16 million elements
-    size_t size = N * sizeof(float);
-
-    float *a = (float*)malloc(size);
-    float *b = (float*)malloc(size);
-    float *c_gpu = (float*)malloc(size);
-    float *c_cpu = (float*)malloc(size);
-    float gpu_time = 0.0f;
-
-    // Seed RNG
-    srand((unsigned int)time(NULL));
-
-    // Random initialization
-    for (int i = 0; i < N; i++) {
-        a[i] = (float)(rand() % 1000) / 100.0f;  // values in [0,10)
-        b[i] = (float)(rand() % 1000) / 100.0f;
+// ---------------- GPU kernel ----------------
+__global__ void vector_add_gpu(const float* a, const float* b, float* c, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        c[idx] = a[idx] + b[idx];
     }
+}
 
-    // --- CPU timing
-    clock_t start_cpu = clock();
-    add_cpu(a, b, c_cpu, N);
-    clock_t end_cpu = clock();
-    double cpu_time = (double)(end_cpu - start_cpu) / CLOCKS_PER_SEC;
+// ---------------- Initialize arrays ----------------
+void init_array(float* a, int n) {
+    for (int i = 0; i < n; i++) {
+        a[i] = (float)(rand() % 1000) / 100.0f;  // values in [0, 10)
+    }
+}
 
-    // --- GPU memory allocation
-    float *d_a, *d_b, *d_c;
-    cudaMalloc((void**)&d_a, size);
-    cudaMalloc((void**)&d_b, size);
-    cudaMalloc((void**)&d_c, size);
-    cudaMemcpy(d_a, a, size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_b, b, size, cudaMemcpyHostToDevice);
+// ---------------- Benchmark CPU ----------------
+double benchmark_cpu(const float* a, const float* b, float* c, int n, int runs) {
+    double total_time = 0.0;
+    for (int i = 0; i < runs; i++) {
+        clock_t start = clock();
+        vector_add_cpu(a, b, c, n);
+        clock_t end = clock();
+        total_time += (double)(end - start) / CLOCKS_PER_SEC;
+    }
+    return (total_time / runs) * 1000;  // return avg time in ms
+}
 
-    // --- GPU timing (CUDA events)
+// ---------------- Benchmark GPU ----------------
+float benchmark_gpu(const float* d_a, const float* d_b, float* d_c, int n, int runs) {
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    int threads_per_block = 256;
-    int blocks_per_grid = (N + threads_per_block - 1) / threads_per_block;
-    cudaEventRecord(start);
-    add<<<blocks_per_grid, threads_per_block>>>(d_a, d_b, d_c, N);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&gpu_time, start, stop);
-    
-    cudaMemcpy(c_gpu, d_c, size, cudaMemcpyDeviceToHost);
-    
-    // --- Check correctness
-    for (int i = 0; i < N; i++) {
-        if (fabs(c_cpu[i] - c_gpu[i]) > 1e-6) {
-            printf("Mismatch at index %d!\n", i);
-        }
+    int blocks = (n + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+    // Warm-up
+    vector_add_gpu<<<blocks, THREADS_PER_BLOCK>>>(d_a, d_b, d_c, n);
+    cudaDeviceSynchronize();
+
+    float total_time = 0.0f;
+    for (int i = 0; i < runs; i++) {
+        cudaEventRecord(start);
+        vector_add_gpu<<<blocks, THREADS_PER_BLOCK>>>(d_a, d_b, d_c, n);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+
+        float elapsed;
+        cudaEventElapsedTime(&elapsed, start, stop);
+        total_time += elapsed;
     }
 
-    // --- Print timing
-    printf("\nCPU time: %f ms\n", cpu_time * 1000);
-    printf("GPU time: %f ms\n", gpu_time);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    return total_time / runs;  // avg kernel execution time in ms
+}
+
+// ---------------- Check correctness ----------------
+void check_result(const float* cpu, const float* gpu, int n) {
+    for (int i = 0; i < n; i++) {
+        if (fabs(cpu[i] - gpu[i]) > 1e-6) {
+            printf("Mismatch at index %d! CPU=%f, GPU=%f\n", i, cpu[i], gpu[i]);
+            return;
+        }
+    }
+    printf("Results are correct.\n");
+}
+
+// ---------------- Main ----------------
+int main() {
+    srand((unsigned int)time(NULL));
+    size_t size = N * sizeof(float);
+
+    // Host arrays
+    float *h_a = (float*)malloc(size);
+    float *h_b = (float*)malloc(size);
+    float *h_c_cpu = (float*)malloc(size);
+    float *h_c_gpu = (float*)malloc(size);
+
+    init_array(h_a, N);
+    init_array(h_b, N);
+
+    // ---------------- CPU benchmark ----------------
+    double cpu_time_ms = benchmark_cpu(h_a, h_b, h_c_cpu, N, CPU_RUNS);
+    printf("Average CPU time over %d runs: %.3f ms\n", CPU_RUNS, cpu_time_ms);
+
+    // ---------------- GPU memory allocation ----------------
+    float *d_a, *d_b, *d_c;
+    cudaMalloc((void**)&d_a, size);
+    cudaMalloc((void**)&d_b, size);
+    cudaMalloc((void**)&d_c, size);
+
+    cudaMemcpy(d_a, h_a, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b, h_b, size, cudaMemcpyHostToDevice);
+
+    // ---------------- GPU benchmark ----------------
+    float gpu_time_ms = benchmark_gpu(d_a, d_b, d_c, N, GPU_RUNS);
+    cudaMemcpy(h_c_gpu, d_c, size, cudaMemcpyDeviceToHost);
+    printf("Average GPU kernel time over %d runs: %.3f ms\n", GPU_RUNS, gpu_time_ms);
+
+    // ---------------- Check results ----------------
+    check_result(h_c_cpu, h_c_gpu, N);
 
     // Cleanup
     cudaFree(d_a);
     cudaFree(d_b);
     cudaFree(d_c);
-    free(a);
-    free(b);
-    free(c_cpu);
-    free(c_gpu);
+    free(h_a);
+    free(h_b);
+    free(h_c_cpu);
+    free(h_c_gpu);
 
     return 0;
 }
