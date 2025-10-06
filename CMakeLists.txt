@@ -19,6 +19,4 @@ else()
 endif()
 
 # Add each benchmark
-# add_subdirectory(benchmarks/00_temp)
 add_subdirectory(benchmarks/01_vector_add)
-# add_subdirectory(benchmarks/02_gemm)

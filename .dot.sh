@@ -5,3 +5,6 @@ nvcc 01_vector_add.cu -o 01_vector_add
 mkdir build && cd build
 cmake ..
 make -j$(nproc)
+
+sudo docker build -t cuda-bench:latest .
+sudo docker run --entrypoint /workspace/build/bin/bench_vector_add --gpus all cuda-bench:latest
